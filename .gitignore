@@ -1,0 +1,29 @@
+# Build output
+build/
+out/
+cmake-build-*/
+.vs/
+.vscode/
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.o
+*.a
+
+# Captured rips (local test output)
+captures/
+*.grm
+*.gframe
+!tools/sample_gen/samples/*.grm
+
+# OS noise
+Thumbs.db
+.DS_Store
+
+# Python (tooling)
+__pycache__/
+*.pyc
