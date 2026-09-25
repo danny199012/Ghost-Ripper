@@ -55,6 +55,11 @@
 #ifndef GL_FRAMEBUFFER_COMPLETE
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #endif
+// ImGui's loader defines GL_PACK_ALIGNMENT but not the unpack enum, which the
+// texture upload path needs for tightly packed non-multiple-of-4 rows.
+#ifndef GL_UNPACK_ALIGNMENT
+#define GL_UNPACK_ALIGNMENT 0x0CF5
+#endif
 
 // ---- function pointer types ----------------------------------------------
 using PFNGLGENFRAMEBUFFERSPROC    = void (APIENTRY*)(int, unsigned int*);

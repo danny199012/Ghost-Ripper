@@ -7,8 +7,11 @@ project(GhostRipper VERSION 0.1.0 LANGUAGES CXX)
 #   ghost-inject   - CLI injector (Windows only)
 #   ghost_hook     - in-process hook DLL: D3D9/11/12 + Vulkan capture (Windows)
 #   ghost-viewer   - Dear ImGui + OpenGL model browser/viewer (cross-platform)
+#   ghost_viewer_core - headless viewer logic used by the GUI and the tests
 #   sample_gen     - writes sample .grm captures for testing
 #   grinfo         - CLI inspector for .grm files
+#
+#   ctest          - headless unit tests (capture format, BC decode, glTF)
 # ---------------------------------------------------------------------------
 
 set(CMAKE_CXX_STANDARD 17)
@@ -17,6 +20,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(GHOST_BUILD_VIEWER   "Build the ghost-viewer GUI"          ON)
 option(GHOST_BUILD_TOOLS    "Build command-line tools"            ON)
+option(GHOST_BUILD_TESTS    "Build the unit tests"                ON)
 option(GHOST_BUILD_HOOK     "Build the hook DLL (Windows only)"   ${WIN32})
 option(GHOST_BUILD_INJECTOR "Build the injector (Windows only)"   ${WIN32})
 
@@ -42,8 +46,13 @@ if(GHOST_BUILD_TOOLS)
     add_subdirectory(tools/grinfo)
 endif()
 
-if(GHOST_BUILD_VIEWER)
-    add_subdirectory(src/viewer)
+# The viewer core library (capture loading, texture decode, exporters) is also
+# built when the GUI is off, so the unit tests keep working on headless hosts.
+add_subdirectory(src/viewer)
+
+if(GHOST_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif()
 
 if(WIN32)

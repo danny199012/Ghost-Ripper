@@ -1,5 +1,6 @@
 #include "texture_loader.h"
 
+#include "bc_decode.h"
 #include "gl_extra.h"
 
 #include <cstring>
@@ -32,6 +33,7 @@ constexpr uint32_t kDdsMagic    = 0x20534444;
 constexpr uint32_t kDDPF_FOURCC = 0x4;
 constexpr uint32_t kDDPF_RGB    = 0x40;
 constexpr uint32_t kDDPF_ALPHA  = 0x1;
+constexpr uint32_t kDDPF_LUM    = 0x20000;
 constexpr uint32_t kFourCC_DX10 = 0x30315844;
 
 struct DdsHeaderDx10 {
@@ -45,6 +47,20 @@ bool read_all(const std::string& path, std::vector<uint8_t>& out) {
     in.seekg(0);
     out.resize(static_cast<size_t>(size));
     return static_cast<bool>(in.read(reinterpret_cast<char*>(out.data()), size));
+}
+
+unsigned int upload_rgba8(const uint8_t* rgba, int width, int height) {
+    unsigned int tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    return tex;
 }
 
 } // namespace
@@ -64,41 +80,53 @@ unsigned int load_dds_texture(const std::string& path, int& width, int& height) 
     DdsHeader header{};
     std::memcpy(&header, bytes.data() + sizeof(uint32_t), sizeof(header));
 
-    width = static_cast<int>(header.width);
+    width  = static_cast<int>(header.width);
     height = static_cast<int>(header.height);
+    if (width <= 0 || height <= 0)
+        return 0;
 
     const bool has_alpha = (header.ddspf.flags & kDDPF_ALPHA) != 0;
     const bool is_rgb    = (header.ddspf.flags & kDDPF_RGB) != 0;
-    const bool is_dx10   = (header.ddspf.flags & kDDPF_FOURCC) != 0 &&
-                           header.ddspf.four_cc == kFourCC_DX10;
+    const bool is_fourcc = (header.ddspf.flags & kDDPF_FOURCC) != 0;
+    const bool is_dx10   = is_fourcc && header.ddspf.four_cc == kFourCC_DX10;
 
-    // For v1 we support the common uncompressed 32bpp RGB(A) layouts. BC
-    // textures (which use the DX10 extension) are not decoded in the viewer
-    // yet; the caller falls back to a checker texture in that case.
-    if (!is_rgb || header.ddspf.rgb_bit_count != 32) {
-        (void)is_dx10;
-        return 0;
+    size_t data_offset = sizeof(uint32_t) + sizeof(DdsHeader);
+    uint32_t dxgi_format = 0;
+    if (is_dx10) {
+        if (bytes.size() < data_offset + sizeof(DdsHeaderDx10))
+            return 0;
+        DdsHeaderDx10 dx10{};
+        std::memcpy(&dx10, bytes.data() + data_offset, sizeof(dx10));
+        dxgi_format = dx10.dxgi_format;
+        data_offset += sizeof(DdsHeaderDx10);
     }
 
-    const size_t data_offset = sizeof(uint32_t) + sizeof(DdsHeader) +
-                               (is_dx10 ? sizeof(DdsHeaderDx10) : 0);
+    // Block-compressed (BC1-BC7): decode on the CPU (OpenGL can't sample it
+    // directly without an extension). The hook writes BC textures with the
+    // DX10 header.
+    if (is_dx10 && bc_decode_supported(dxgi_format)) {
+        const size_t need = bc_surface_size(dxgi_format, static_cast<uint32_t>(width),
+                                            static_cast<uint32_t>(height));
+        if (need == 0 || bytes.size() < data_offset + need)
+            return 0;
+        std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4);
+        if (!decode_bc_surface(dxgi_format, static_cast<uint32_t>(width),
+                               static_cast<uint32_t>(height), bytes.data() + data_offset, need,
+                               rgba.data()))
+            return 0;
+        return upload_rgba8(rgba.data(), width, height);
+    }
+
+    // Uncompressed 32bpp RGB(A) (the common D3D9/D3D11 case).
+    if (!is_rgb || header.ddspf.rgb_bit_count != 32)
+        return 0;
     if (bytes.size() < data_offset + static_cast<size_t>(width) * height * 4)
         return 0;
 
     const uint8_t* pixels = bytes.data() + data_offset;
-    const uint32_t r_mask = header.ddspf.r_mask;
-    // BGRA (B in low bits) vs RGBA. D3D's B8G8R8A8 is far more common.
-    const bool is_bgra = (r_mask == 0x00FF0000);
+    // BGRA (B in the low bits) vs RGBA. D3D's B8G8R8A8 is far more common.
+    const bool is_bgra = (header.ddspf.r_mask == 0x00FF0000);
 
-    unsigned int tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-
-    // Upload as RGBA8, swapping channels if the source was BGRA.
     std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4);
     for (int i = 0; i < width * height; ++i) {
         const uint8_t* src = pixels + static_cast<size_t>(i) * 4;
@@ -107,10 +135,7 @@ unsigned int load_dds_texture(const std::string& path, int& width, int& height) 
         else         { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
         if (!has_alpha) dst[3] = 255;
     }
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 rgba.data());
-    glGenerateMipmap(GL_TEXTURE_2D);
-    return tex;
+    return upload_rgba8(rgba.data(), width, height);
 }
 
 unsigned int create_checker_texture() {

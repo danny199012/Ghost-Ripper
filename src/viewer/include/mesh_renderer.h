@@ -22,7 +22,9 @@ public:
     bool initialize();
 
     // Upload a mesh to GPU buffers; returns a handle (id) for drawing.
-    // Replaces any previously uploaded mesh.
+    // Replaces any previously uploaded mesh. If the mesh references a
+    // captured texture it is loaded here; otherwise the checker fallback is
+    // used.
     void upload(const GPUMesh& mesh);
 
     // Draw the uploaded mesh with the current camera matrices.
@@ -35,6 +37,15 @@ public:
     const Vec3& aabb_min() const { return aabb_min_; }
     const Vec3& aabb_max() const { return aabb_max_; }
 
+    // Bound texture state (for the inspector's texture preview).
+    bool has_real_texture() const { return mesh_texture_ != 0; }
+    unsigned int texture_id() const {
+        return mesh_texture_ ? mesh_texture_ : checker_tex_;
+    }
+    int texture_width() const { return tex_width_; }
+    int texture_height() const { return tex_height_; }
+    const std::string& texture_path() const { return texture_path_; }
+
 private:
     unsigned int program_       = 0;
     unsigned int vao_           = 0;
@@ -43,6 +54,10 @@ private:
     unsigned int uv_buffer_     = 0;
     unsigned int index_buffer_  = 0;
     unsigned int checker_tex_   = 0;
+    unsigned int mesh_texture_  = 0;   // 0 -> no captured texture
+    int          tex_width_     = 0;
+    int          tex_height_    = 0;
+    std::string  texture_path_;
     uint32_t     triangle_count_ = 0;
     bool         has_uvs_ = false;
     Vec3         aabb_min_{};

@@ -1,7 +1,6 @@
-// Minimal DDS texture loader for the viewer. Loads uncompressed 2D DDS files
-// (RGBA8/BGRA8) and uploads them to an OpenGL texture. BC-compressed formats
-// are decoded on the CPU only if needed; for v1 the viewer supports
-// uncompressed textures and falls back to a checker texture otherwise.
+// DDS texture loader for the viewer. Handles uncompressed 32bpp RGB(A)
+// (legacy header) and block-compressed BC1-BC7 (DX10 header, decoded on the
+// CPU via bc_decode.h) and uploads the result as an RGBA8 OpenGL texture.
 #pragma once
 
 #include <cstdint>

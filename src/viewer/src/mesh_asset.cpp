@@ -6,16 +6,42 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <sys/stat.h>
 
 #ifdef _WIN32
 #include <windows.h>
+#define SEP '\\'
+#define SEP_STR "\\"
 #else
 #include <dirent.h>
+#define SEP '/'
+#define SEP_STR "/"
 #endif
 
 namespace ghost {
 namespace viewer {
+
+namespace {
+
+bool dir_exists_impl(const std::string& path) {
+#ifdef _WIN32
+    const DWORD a = GetFileAttributesA(path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st{};
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+uint64_t file_size_impl(const std::string& path) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0)
+        return 0;
+    return static_cast<uint64_t>(st.st_size);
+}
+
+} // namespace
 
 namespace {
 
@@ -83,64 +109,91 @@ void compute_face_normals(GPUMesh& out) {
     }
 }
 
-bool mesh_has_position(const MeshFile& mesh) {
-    for (const auto& a : mesh.attributes())
-        if (a.semantic == static_cast<uint32_t>(fmt::Semantic::Position))
-            return true;
-    return false;
+// Decode one attribute element from the mesh's raw vertex blob using an
+// explicit attribute record (the file's own or a user override).
+bool decode_with(const MeshFile& mesh, uint32_t stride, const fmt::MeshAttribute& a,
+                 uint32_t i, float out[4]) {
+    const uint8_t* raw = mesh.vertex_data();
+    if (!raw || i >= mesh.header().vertex_count)
+        return false;
+    return decode_attribute(raw + static_cast<size_t>(i) * stride + a.offset,
+                            static_cast<fmt::AttributeFormat>(a.format), out);
+}
+
+const fmt::MeshAttribute* find_attr(const std::vector<fmt::MeshAttribute>& attrs,
+                                    fmt::Semantic semantic, uint32_t index) {
+    for (const auto& a : attrs)
+        if (a.semantic == static_cast<uint32_t>(semantic) && a.semantic_index == index)
+            return &a;
+    return nullptr;
 }
 
 } // namespace
 
-std::unique_ptr<GPUMesh> load_mesh(const std::string& path, std::string* err) {
+std::unique_ptr<GPUMesh> load_mesh(const std::string& path, std::string* err,
+                                   const LayoutOverride* layout) {
     auto out = std::make_unique<GPUMesh>();
     MeshFile mesh;
     if (!mesh.load(path, err))
         return nullptr;
-    if (!mesh_has_position(mesh)) {
+
+    const std::vector<fmt::MeshAttribute>& attrs =
+        (layout && !layout->attributes.empty()) ? layout->attributes : mesh.attributes();
+    const uint32_t stride = mesh.header().vertex_stride;
+    const uint32_t vc     = mesh.header().vertex_count;
+
+    const fmt::MeshAttribute* pos_attr = find_attr(attrs, fmt::Semantic::Position, 0);
+    if (!pos_attr) {
         if (err) *err = "no POSITION attribute in " + path;
         return nullptr;
     }
 
-    const uint32_t vc = mesh.header().vertex_count;
+    out->attributes    = attrs;
+    out->vertex_stride = stride;
     out->positions.resize(static_cast<size_t>(vc) * 3);
-
     for (uint32_t i = 0; i < vc; ++i) {
-        Vec3 p;
-        if (!mesh.position(i, p)) {
-            if (err) *err = "failed to decode position " + std::to_string(i);
-            return nullptr;
+        float p[4]{};
+        if (decode_with(mesh, stride, *pos_attr, i, p)) {
+            out->positions[i * 3 + 0] = p[0];
+            out->positions[i * 3 + 1] = p[1];
+            out->positions[i * 3 + 2] = p[2];
         }
-        out->positions[i * 3 + 0] = p.x;
-        out->positions[i * 3 + 1] = p.y;
-        out->positions[i * 3 + 2] = p.z;
     }
 
     // Normals (optional).
-    for (uint32_t i = 0; i < vc; ++i) {
-        Vec3 n;
-        if (mesh.normal(i, n)) {
-            if (!out->has_normals) {
-                out->has_normals = true;
-                out->normals.resize(static_cast<size_t>(vc) * 3, 0.0f);
+    if (const fmt::MeshAttribute* n_attr = find_attr(attrs, fmt::Semantic::Normal, 0)) {
+        std::vector<float> normals(static_cast<size_t>(vc) * 3, 0.0f);
+        bool any = false;
+        for (uint32_t i = 0; i < vc; ++i) {
+            float n[4]{};
+            if (decode_with(mesh, stride, *n_attr, i, n)) {
+                normals[i * 3 + 0] = n[0];
+                normals[i * 3 + 1] = n[1];
+                normals[i * 3 + 2] = n[2];
+                any = true;
             }
-            out->normals[i * 3 + 0] = n.x;
-            out->normals[i * 3 + 1] = n.y;
-            out->normals[i * 3 + 2] = n.z;
+        }
+        if (any) {
+            out->has_normals = true;
+            out->normals = std::move(normals);
         }
     }
 
     // UVs, channel 0 only (optional).
-    Vec2 probe;
-    if (mesh.texcoord(0, 0, probe)) {
-        out->has_uvs = true;
-        out->uvs.resize(static_cast<size_t>(vc) * 2, 0.0f);
+    if (const fmt::MeshAttribute* uv_attr = find_attr(attrs, fmt::Semantic::TexCoord, 0)) {
+        std::vector<float> uvs(static_cast<size_t>(vc) * 2, 0.0f);
+        bool any = false;
         for (uint32_t i = 0; i < vc; ++i) {
-            Vec2 u;
-            if (mesh.texcoord(i, 0, u)) {
-                out->uvs[i * 2 + 0] = u.x;
-                out->uvs[i * 2 + 1] = u.y;
+            float u[4]{};
+            if (decode_with(mesh, stride, *uv_attr, i, u)) {
+                uvs[i * 2 + 0] = u[0];
+                uvs[i * 2 + 1] = u[1];
+                any = true;
             }
+        }
+        if (any) {
+            out->has_uvs = true;
+            out->uvs = std::move(uvs);
         }
     }
 
@@ -154,7 +207,69 @@ std::unique_ptr<GPUMesh> load_mesh(const std::string& path, std::string* err) {
     out->aabb_max = {mesh.header().aabb_max[0], mesh.header().aabb_max[1],
                      mesh.header().aabb_max[2]};
     out->triangle_count = static_cast<uint32_t>(out->indices.size() / 3);
+
+    // First diffuse texture, resolved against the capture folder.
+    for (const auto& t : mesh.textures()) {
+        if (t.usage == static_cast<uint32_t>(fmt::TextureUsage::Diffuse) && t.file[0]) {
+            out->texture_rel = t.file;
+            break;
+        }
+    }
+    if (out->texture_rel.empty()) {
+        for (const auto& t : mesh.textures()) {
+            if (t.file[0]) {  // any bound texture is better than none
+                out->texture_rel = t.file;
+                break;
+            }
+        }
+    }
+    if (!out->texture_rel.empty()) {
+        std::string rel = out->texture_rel;
+        for (char& c : rel)
+            if (c == '/')
+                c = SEP;
+        out->texture_abs = parent_dir(path) + SEP + rel;
+    }
     return out;
+}
+
+std::string parent_dir(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    return (slash == std::string::npos) ? std::string() : path.substr(0, slash);
+}
+
+bool save_layout_override(const std::string& grm_path,
+                          const std::vector<fmt::MeshAttribute>& attributes,
+                          std::string* err) {
+    std::ofstream out(grm_path + ".layout", std::ios::trunc);
+    if (!out) {
+        if (err) *err = "cannot write " + grm_path + ".layout";
+        return false;
+    }
+    out << "# Ghost-Ripper viewer vertex layout override\n"
+        << "# semantic semantic_index format offset\n";
+    for (const auto& a : attributes)
+        out << a.semantic << ' ' << a.semantic_index << ' ' << a.format << ' ' << a.offset
+            << '\n';
+    return static_cast<bool>(out);
+}
+
+bool load_layout_override(const std::string& grm_path,
+                          std::vector<fmt::MeshAttribute>& attributes) {
+    std::ifstream in(grm_path + ".layout");
+    if (!in)
+        return false;
+    attributes.clear();
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#')
+            continue;
+        std::istringstream ls(line);
+        fmt::MeshAttribute a{};
+        if (ls >> a.semantic >> a.semantic_index >> a.format >> a.offset)
+            attributes.push_back(a);
+    }
+    return !attributes.empty();
 }
 
 namespace {
@@ -190,11 +305,51 @@ std::vector<std::string> list_grm_files(const std::string& dir) {
     return files;
 }
 
+std::vector<std::string> list_subdirs(const std::string& dir, const std::string& prefix) {
+    std::vector<std::string> dirs;
+#ifdef _WIN32
+    std::string pattern = dir + "\\*";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return dirs;
+    do {
+        const std::string name = fd.cFileName;
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && name != "." && name != ".." &&
+            name.rfind(prefix, 0) == 0)
+            dirs.push_back(dir + "\\" + name);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir.c_str());
+    if (!d) return dirs;
+    while (struct dirent* e = readdir(d)) {
+        const std::string name = e->d_name;
+        if (name == "." || name == ".." || name.rfind(prefix, 0) != 0)
+            continue;
+        if (dir_exists_impl(dir + "/" + name))
+            dirs.push_back(dir + "/" + name);
+    }
+    closedir(d);
+#endif
+    std::sort(dirs.begin(), dirs.end());
+    return dirs;
+}
+
 } // namespace
+
+std::vector<std::string> list_frame_dirs(const std::string& session_dir) {
+    return list_subdirs(session_dir, "frame_");
+}
 
 std::vector<MeshInfo> scan_capture_dir(const std::string& dir, std::string* err) {
     std::vector<MeshInfo> infos;
-    const std::vector<std::string> files = list_grm_files(dir);
+    // Hook frames keep meshes in a meshes/ subfolder; sample_gen writes a flat
+    // folder. Accept both.
+    std::vector<std::string> files = list_grm_files(dir);
+    const std::vector<std::string> nested = list_grm_files(dir + SEP_STR + "meshes");
+    files.insert(files.end(), nested.begin(), nested.end());
+    std::sort(files.begin(), files.end());
     for (const std::string& f : files) {
         MeshFile mesh;
         if (!mesh.load(f)) {
@@ -215,9 +370,59 @@ std::vector<MeshInfo> scan_capture_dir(const std::string& dir, std::string* err)
             if (a.semantic == static_cast<uint32_t>(fmt::Semantic::Normal))   info.has_normals = true;
             if (a.semantic == static_cast<uint32_t>(fmt::Semantic::TexCoord)) info.has_uvs = true;
         }
+        info.texture_count = static_cast<uint32_t>(mesh.textures().size());
+        for (const auto& t : mesh.textures()) {
+            if (t.file[0]) {
+                info.texture_rel = t.file;
+                break;
+            }
+        }
         infos.push_back(std::move(info));
     }
     return infos;
+}
+
+CaptureStats compute_capture_stats(const std::string& dir) {
+    CaptureStats stats;
+    const std::vector<MeshInfo> infos = scan_capture_dir(dir);
+    stats.mesh_count = static_cast<uint32_t>(infos.size());
+    for (const auto& m : infos) {
+        stats.vertex_count += m.vertex_count;
+        stats.triangle_count += m.triangle_count;
+        stats.texture_count += m.texture_count;
+    }
+
+    // Texture bytes on disk: the frame's textures/ folder, or (for a session
+    // folder) every frame's textures/ folder.
+    std::vector<std::string> texture_dirs{dir + SEP_STR + "textures"};
+    for (const std::string& frame : list_frame_dirs(dir))
+        texture_dirs.push_back(frame + SEP_STR + "textures");
+    for (const std::string& tex_dir : texture_dirs) {
+#ifdef _WIN32
+        const std::string pattern = tex_dir + "\\*.dds";
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE)
+            continue;
+        do {
+            stats.texture_bytes += (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) |
+                                   fd.nFileSizeLow;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+#else
+        DIR* d = opendir(tex_dir.c_str());
+        if (!d)
+            continue;
+        while (struct dirent* e = readdir(d)) {
+            const std::string name = e->d_name;
+            if (has_suffix(name, ".dds"))
+                stats.texture_bytes += file_size_impl(tex_dir + "/" + name);
+        }
+        closedir(d);
+#endif
+    }
+    stats.frame_count = static_cast<uint32_t>(list_frame_dirs(dir).size());
+    return stats;
 }
 
 } // namespace viewer
