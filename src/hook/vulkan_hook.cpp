@@ -9,6 +9,8 @@
 #include <cstring>
 #include <unordered_map>
 
+#include <windows.h>  // GetModuleHandleA / GetProcAddress (vulkan.h alone pulls nothing)
+
 #include <vulkan/vulkan.h>
 
 namespace ghost {
