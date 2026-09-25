@@ -1,18 +1,32 @@
-// Direct3D 12 hooking (scaffolding).
+// Direct3D 12 hooking + draw capture.
 //
-// D3D12 capture is harder than D3D11: command lists are recorded on the CPU
-// and executed asynchronously, buffers live in upload/default heaps, and the
-// same command list is reset and reused. The plan:
-//   1. Hook IDXGISwapChain3::Present (frame boundary) as in D3D11.
-//   2. Hook ID3D12CommandQueue::ExecuteCommandLists to observe the lists.
-//   3. At capture time, snapshot the bound IA vertex/index buffers and
-//      resources by copying their GPU descriptors into a readback heap, then
-//      copy-mapping. (D3D12 has no live "current state" query, so we capture
-//      descriptor tables seen by ExecuteCommandLists in that frame.)
+// D3D12 has no live "current state" to query at Present time: command lists
+// are recorded on the CPU and executed asynchronously, buffers live in
+// default heaps, and the same command list is reset and reused. The capture
+// therefore works in two phases:
 //
-// Only step 1 (frame-boundary detection) is implemented now so captures are
-// opened/closed correctly and the manifest is written; actual buffer dump is
-// TODO. See docs/ROADMAP.md.
+//   1. Recording time. We detour the ID3D12GraphicsCommandList vtable (shared
+//      by every instance) to observe what the game records: IASetVertexBuffers
+//      (44), IASetIndexBuffer (43), IASetPrimitiveTopology (20) maintain a
+//      small per-command-list state, and DrawInstanced (12) /
+//      DrawIndexedInstanced (13) snapshot the bound views into a pending-draw
+//      list while a capture frame is open. ID3D12Device::CreateCommitted-
+//      Resource (27) / CreatePlacedResource (29) keep a GPU-VA -> resource
+//      map so the views can be resolved to the underlying ID3D12Resource.
+//      ID3D12CommandQueue::ExecuteCommandLists (10) hands us the direct
+//      queue + device used for the readback.
+//
+//   2. Present time (frame boundary). The recorded vertex/index ranges are
+//      copied into one readback heap with an internal command list on the
+//      game's direct queue (buffers are implicitly state-promoted from
+//      COMMON, so no barriers are needed), a fence is waited on, and every
+//      pending draw is written out as a .grm file. Indexed draws are trimmed
+//      to the vertex range their indices actually reference.
+//
+// Limitations (see docs/ROADMAP.md): draws inside bundles are recorded when
+// the bundle is recorded (once, not per execution); resources created before
+// the hook DLL was injected are unknown to the VA map; stream 1+ vertex
+// buffers and texture capture need GRMF v2 / descriptor tracking.
 #pragma once
 
 namespace ghost {

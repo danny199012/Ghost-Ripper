@@ -21,25 +21,36 @@ namespace {
 
 // Expand strip/line topologies into triangle lists so the renderer only needs
 // one draw mode. Also skips degenerate / unknown primitives.
+// Indices are stored as raw buffer indices; base_vertex (which may be
+// negative after slicing a captured range) maps them into the stored slice.
 void expand_triangles(const MeshFile& mesh, GPUMesh& out) {
     const fmt::PrimitiveTopology topo =
         static_cast<fmt::PrimitiveTopology>(mesh.header().topology);
     const uint32_t count = mesh.header().index_count ? mesh.header().index_count
                                                       : mesh.header().vertex_count;
+    const int64_t  base_vertex = mesh.header().base_vertex;
+    const uint32_t vc = mesh.header().vertex_count;
 
-    auto push_tri = [&](uint32_t a, uint32_t b, uint32_t c) {
-        out.indices.push_back(a);
-        out.indices.push_back(b);
-        out.indices.push_back(c);
+    auto push_tri = [&](int64_t a, int64_t b, int64_t c) {
+        if (a < 0 || b < 0 || c < 0)
+            return;  // index outside the captured vertex slice
+        if (static_cast<uint64_t>(a) >= vc || static_cast<uint64_t>(b) >= vc ||
+            static_cast<uint64_t>(c) >= vc)
+            return;
+        out.indices.push_back(static_cast<uint32_t>(a));
+        out.indices.push_back(static_cast<uint32_t>(b));
+        out.indices.push_back(static_cast<uint32_t>(c));
+    };
+    auto v = [&](uint32_t i) -> int64_t {
+        return static_cast<int64_t>(mesh.index(i)) + base_vertex;
     };
 
     if (topo == fmt::PrimitiveTopology::TriangleList) {
         for (uint32_t i = 0; i + 2 < count; i += 3)
-            push_tri(mesh.index(i), mesh.index(i + 1), mesh.index(i + 2));
+            push_tri(v(i), v(i + 1), v(i + 2));
     } else if (topo == fmt::PrimitiveTopology::TriangleStrip) {
         for (uint32_t i = 0; i + 2 < count; ++i)
-            push_tri(mesh.index(i), mesh.index(i + (i & 1) ? 2 : 1),
-                     mesh.index(i + (i & 1) ? 1 : 2));
+            push_tri(v(i), v(i + (i & 1) ? 2 : 1), v(i + (i & 1) ? 1 : 2));
     }
     // Line/point topologies are ignored for the 3D viewport for now.
 }
