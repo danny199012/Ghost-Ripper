@@ -26,6 +26,9 @@ if(GHOST_BUILD_VIEWER)
         ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     )
     target_compile_definitions(ghost_imgui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+    # imgui_impl_glfw.cpp includes <GLFW/glfw3.h>; those include dirs come
+    # from the glfw target, so ghost_imgui has to link it as well.
+    target_link_libraries(ghost_imgui PRIVATE glfw)
 
     # ghost-viewer: Dear ImGui + OpenGL3 + GLFW desktop app.
     add_executable(ghost-viewer
