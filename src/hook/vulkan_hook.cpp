@@ -118,7 +118,13 @@ std::mutex g_mutex;
 std::unordered_map<VkCommandBuffer, CmdState> g_cmd_state;
 std::unordered_map<VkCommandBuffer, VkDevice> g_cmd_device;
 std::unordered_map<VkPipeline, PipelineInfo> g_pipeline_info;
-std::unordered_map<VkQueue, VkDevice> g_queue_device;
+// Queues we have seen, with the device and family they belong to (the
+// family index is needed to create the readback command pool).
+struct QueueInfo {
+    VkDevice device = VK_NULL_HANDLE;
+    uint32_t family = 0;
+};
+std::unordered_map<VkQueue, QueueInfo> g_queue_info;
 std::vector<RecordedDraw> g_pending;
 
 bool g_fan_warned = false;
@@ -214,10 +220,10 @@ void on_new_device(VkDevice device) {
                          g_fn_create_pipelines);
 }
 
-void record_queue(VkDevice device, VkQueue* queue) {
+void record_queue(VkDevice device, uint32_t family, VkQueue* queue) {
     if (queue && *queue) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_queue_device[*queue] = device;
+        g_queue_info[*queue] = QueueInfo{device, family};
     }
 }
 
@@ -379,6 +385,8 @@ void record_draw(VkCommandBuffer cb, uint32_t index_count, uint32_t first_index,
     CaptureContext& cap = CaptureContext::instance();
     if (!cap.capturing())
         return;
+    if (index_count == 0 && vertex_count == 0)
+        return;  // empty draw
 
     CmdState st;
     VkDevice device;
@@ -480,13 +488,13 @@ VkResult VKAPI_PTR hk_create_graphics_pipelines(VkDevice device, VkPipelineCache
 void VKAPI_PTR hk_get_device_queue_device(VkDevice device, uint32_t family, uint32_t index,
                                          VkQueue* queue) {
     reinterpret_cast<GetDeviceQueueFn>(g_fn_get_device_queue.orig)(device, family, index, queue);
-    record_queue(device, queue);
+    record_queue(device, family, queue);
 }
 
 void VKAPI_PTR hk_get_device_queue2_device(VkDevice device, const VkDeviceQueueInfo2* info,
                                           VkQueue* queue) {
     reinterpret_cast<GetDeviceQueue2Fn>(g_fn_get_device_queue2.orig)(device, info, queue);
-    record_queue(device, queue);
+    record_queue(device, info ? info->queueFamilyIndex : 0, queue);
 }
 
 // ---------------------------------------------------------------------------
@@ -594,13 +602,16 @@ bool find_mappable_memory(VkDevice device, const DeviceVulkan& vk, uint32_t bits
 bool flush_pending_draws(VkQueue queue) {
     std::vector<RecordedDraw> draws;
     VkDevice device = VK_NULL_HANDLE;
+    uint32_t queue_family = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         draws = std::move(g_pending);
         g_pending.clear();
-        auto qit = g_queue_device.find(queue);
-        if (qit != g_queue_device.end())
-            device = qit->second;
+        auto qit = g_queue_info.find(queue);
+        if (qit != g_queue_info.end()) {
+            device = qit->second.device;
+            queue_family = qit->second.family;
+        }
         for (auto it = draws.begin(); it != draws.end();) {
             if (device && it->device != device)
                 it = draws.erase(it);  // draws from other devices: not on this queue
@@ -700,6 +711,9 @@ bool flush_pending_draws(VkQueue queue) {
     VkCommandPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    // The pool must belong to the family that owns the presenting queue, or
+    // the copy commands would not be valid on it.
+    pci.queueFamilyIndex = queue_family;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     if (vk.create_command_pool(device, &pci, nullptr, &pool) != VK_SUCCESS) {
@@ -928,7 +942,7 @@ void VKAPI_PTR hk_get_device_queue_export(VkDevice device, uint32_t family, uint
                                           VkQueue* queue) {
     on_new_device(device);
     g_orig_get_device_queue_export(device, family, index, queue);
-    record_queue(device, queue);
+    record_queue(device, family, queue);
 }
 
 VkResult VKAPI_PTR hk_allocate_command_buffers_export(VkDevice device,

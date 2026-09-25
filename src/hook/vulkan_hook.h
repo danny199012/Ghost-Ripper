@@ -18,8 +18,11 @@
 // queue (submit + fence wait) and written out as .grm files.
 //
 // Limitations (see docs/ROADMAP.md): apps that dig raw ICD pointers out of
-// the dispatch table bypass the loader (rare; they also break layers); draw
-// indirect is not captured; stream 1+ and texture capture need GRMF v2.
+// the dispatch table bypass the loader (rare; they also break layers); only
+// the first ICD's function pointers are hooked (and therefore only its
+// devices are captured); draw indirect is not captured; stream 1+ and texture
+// capture need GRMF v2; pipeline/command-buffer bookkeeping is never pruned
+// (one entry per distinct handle for the process lifetime).
 #pragma once
 
 namespace ghost {

@@ -309,6 +309,8 @@ void record_draw(ID3D12GraphicsCommandList* list, uint32_t index_count, uint32_t
     CaptureContext& cap = CaptureContext::instance();
     if (!cap.capturing())
         return;
+    if (index_count == 0 && vertex_count == 0)
+        return;  // empty draw
 
     ListState st;
     {

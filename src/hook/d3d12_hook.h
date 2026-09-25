@@ -26,7 +26,11 @@
 // Limitations (see docs/ROADMAP.md): draws inside bundles are recorded when
 // the bundle is recorded (once, not per execution); resources created before
 // the hook DLL was injected are unknown to the VA map; stream 1+ vertex
-// buffers and texture capture need GRMF v2 / descriptor tracking.
+// buffers and texture capture need GRMF v2 / descriptor tracking; the buffers
+// of a draw that was submitted on a *different* direct queue may not be final
+// when the readback copy on the capture queue runs; the VA map and per-list
+// state are never pruned (they hold one entry per distinct buffer/list for the
+// lifetime of the process, which is small for a capture session).
 #pragma once
 
 namespace ghost {
