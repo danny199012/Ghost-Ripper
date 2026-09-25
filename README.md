@@ -109,10 +109,15 @@ ghost-inject.exe --exe "C:\Games\MyGame\game.exe" --dll ghost_hook.dll
 You can preview the viewer without a game by generating sample captures:
 
 ```sh
-sample_gen captures/demo        # writes a few .grm files
-ghost-viewer captures/demo      # open them in the viewer
-grinfo captures/demo/cube.grm   # inspect a capture file
+sample_gen captures/demo            # cube/sphere/grid + a textured cube, plus
+                                    # captures/session/frame_00000{1,2} trees
+ghost-viewer captures/session       # frame browser across the two frames
+ghost-viewer captures/demo          # flat folder (texture preview, glTF export)
+grinfo captures/demo/cube.grm       # inspect a capture file
 ```
+
+The sample data includes a 32bpp DDS so the texture panel and the glTF
+export's texture references work out of the box.
 
 ## Documentation
 
