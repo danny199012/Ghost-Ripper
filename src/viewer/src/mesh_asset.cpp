@@ -228,7 +228,17 @@ std::unique_ptr<GPUMesh> load_mesh(const std::string& path, std::string* err,
         for (char& c : rel)
             if (c == '/')
                 c = SEP;
-        out->texture_abs = parent_dir(path) + SEP + rel;
+        // Hook captures keep meshes in a <frame>/meshes/ subfolder while the
+        // textures live in <frame>/textures/, so resolve against the capture
+        // root (the parent of meshes/) rather than the mesh's own folder.
+        std::string base = parent_dir(path);
+        const std::string base_name_only = [](const std::string& p) {
+            const size_t slash = p.find_last_of("\\/");
+            return slash == std::string::npos ? p : p.substr(slash + 1);
+        }(base);
+        if (base_name_only == "meshes")
+            base = parent_dir(base);
+        out->texture_abs = base + SEP + rel;
     }
     return out;
 }

@@ -31,6 +31,43 @@
 #include "imgui_impl_opengl3_loader.h"
 
 // Path separator as a string ("\\" on Windows, "/" elsewhere).
+
+// Relative URI from a directory to a file, for glTF texture references: the
+// exporter writes the .gltf into a specific folder, and the DDS may sit in a
+// sibling folder (frame/meshes/ vs frame/textures/). Falls back to the plain
+// path when the two share no root (e.g. different drives).
+std::string relative_uri(const std::string& from_dir, const std::string& to) {
+    const auto split = [](const std::string& s) {
+        std::vector<std::string> parts;
+        std::string cur;
+        for (char c : s) {
+            if (c == '/' || c == '\\') {
+                if (!cur.empty()) parts.push_back(cur);
+                cur.clear();
+            } else {
+                cur += c;
+            }
+        }
+        if (!cur.empty()) parts.push_back(cur);
+        return parts;
+    };
+    const std::vector<std::string> a = split(from_dir);
+    const std::vector<std::string> b = split(to);
+    size_t common = 0;
+    while (common < a.size() && common < b.size() && a[common] == b[common])
+        ++common;
+    if (common == 0)
+        return to;  // no shared root: use the absolute path
+    std::string out;
+    for (size_t i = common; i < a.size(); ++i)
+        out += "../";
+    for (size_t i = common; i < b.size(); ++i) {
+        out += b[i];
+        if (i + 1 < b.size())
+            out += '/';
+    }
+    return out;
+}
 #ifdef _WIN32
 #define SEP_S "\\"
 #else
@@ -612,7 +649,8 @@ void draw_inspector(AppState& s, ghost::viewer::MeshRenderer& renderer) {
         in.mesh = s.gpu_mesh.get();
         in.name = s.meshes[s.selected].name;
         if (!s.gpu_mesh->texture_rel.empty())
-            in.texture_uri = "../" + s.gpu_mesh->texture_rel;
+            in.texture_uri = relative_uri(ghost::viewer::parent_dir(out),
+                                          s.gpu_mesh->texture_abs);
         const std::vector<ghost::viewer::GltfMeshInput> inputs{in};
         if (ghost::viewer::export_gltf(out, inputs, &err))
             s.status = "exported " + out;
@@ -639,6 +677,10 @@ void draw_inspector(AppState& s, ghost::viewer::MeshRenderer& renderer) {
     ImGui::SameLine();
     if (ImGui::Button("Export frame glTF")) {
         // All meshes of the folder become nodes of one scene.
+        std::string out_path = s.capture_dir;
+        if (!out_path.empty() && (out_path.back() == '/' || out_path.back() == '\\'))
+            out_path.pop_back();
+        out_path += SEP_S + std::string("frame.gltf");
         std::vector<ghost::viewer::GltfMeshInput> inputs;
         std::vector<std::unique_ptr<ghost::viewer::GPUMesh>> keep;
         for (const auto& info : s.meshes) {
@@ -648,19 +690,16 @@ void draw_inspector(AppState& s, ghost::viewer::MeshRenderer& renderer) {
                 continue;
             ghost::viewer::GltfMeshInput in;
             in.name = info.name;
-            if (!mesh->texture_rel.empty())
-                in.texture_uri = "../" + mesh->texture_rel;
+            if (!mesh->texture_abs.empty())
+                in.texture_uri = relative_uri(ghost::viewer::parent_dir(out_path),
+                                              mesh->texture_abs);
             keep.push_back(std::move(mesh));
             in.mesh = keep.back().get();
             inputs.push_back(in);
         }
-        std::string out = s.capture_dir;
-        if (!out.empty() && (out.back() == '/' || out.back() == '\\'))
-            out.pop_back();
-        out += SEP_S + std::string("frame.gltf");
         std::string err;
-        if (!inputs.empty() && ghost::viewer::export_gltf(out, inputs, &err))
-            s.status = "exported " + std::to_string(inputs.size()) + " meshes -> " + out;
+        if (!inputs.empty() && ghost::viewer::export_gltf(out_path, inputs, &err))
+            s.status = "exported " + std::to_string(inputs.size()) + " meshes -> " + out_path;
         else
             s.status = "frame glTF export failed: " + err;
     }

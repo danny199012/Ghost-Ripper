@@ -11,3 +11,7 @@ add_test(NAME bc_decode COMMAND test_bc_decode)
 add_executable(test_gltf_export test_gltf_export.cpp)
 target_link_libraries(test_gltf_export PRIVATE ghost_viewer_core)
 add_test(NAME gltf_export COMMAND test_gltf_export)
+
+add_executable(test_viewer_assets test_viewer_assets.cpp)
+target_link_libraries(test_viewer_assets PRIVATE ghost_viewer_core)
+add_test(NAME viewer_assets COMMAND test_viewer_assets)
