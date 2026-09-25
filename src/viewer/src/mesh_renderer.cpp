@@ -71,6 +71,7 @@ MeshRenderer::~MeshRenderer() {
     if (vao_)          glDeleteVertexArrays(1, &vao_);
     if (program_)      glDeleteProgram(program_);
     if (checker_tex_)  glDeleteTextures(1, &checker_tex_);
+    if (mesh_texture_) glDeleteTextures(1, &mesh_texture_);
 }
 
 bool MeshRenderer::initialize() {
@@ -134,6 +135,23 @@ void MeshRenderer::upload(const GPUMesh& mesh) {
 
     glBindVertexArray(0);
 
+    // Load the captured texture the mesh referenced (if any).
+    if (mesh_texture_) {
+        glDeleteTextures(1, &mesh_texture_);
+        mesh_texture_ = 0;
+    }
+    tex_width_ = tex_height_ = 0;
+    texture_path_.clear();
+    if (!mesh.texture_abs.empty()) {
+        int w = 0, h = 0;
+        mesh_texture_ = load_dds_texture(mesh.texture_abs, w, h);
+        if (mesh_texture_) {
+            tex_width_    = w;
+            tex_height_   = h;
+            texture_path_ = mesh.texture_abs;
+        }
+    }
+
     triangle_count_ = mesh.triangle_count;
     aabb_min_ = mesh.aabb_min;
     aabb_max_ = mesh.aabb_max;
@@ -152,7 +170,7 @@ void MeshRenderer::draw(const float mvp[16], const float model_view[16],
                 show_texture && has_uvs_ ? 1 : 0);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, checker_tex_);
+    glBindTexture(GL_TEXTURE_2D, mesh_texture_ ? mesh_texture_ : checker_tex_);
     glUniform1i(glGetUniformLocation(program_, "u_tex"), 0);
 
     if (wireframe)

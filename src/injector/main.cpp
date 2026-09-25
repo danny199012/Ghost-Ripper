@@ -57,7 +57,7 @@ void enable_debug_privilege() {
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
         return;
     LUID luid{};
-    if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+    if (LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luid)) {
         TOKEN_PRIVILEGES tp{};
         tp.PrivilegeCount = 1;
         tp.Privileges[0].Luid = luid;

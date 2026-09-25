@@ -2,16 +2,19 @@
 
 #include "capture_context.h"
 #include "hook_manager.h"
+#include "texture_dump.h"
 
 #include "ghost/attribute_guess.h"
 #include "ghost/capture_writer.h"
 #include "ghost/log.h"
 
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include <d3d9.h>
+#include <dxgiformat.h>  // DXGI_FORMAT_* for the DDS writer
 #include <wrl/client.h>
 
 namespace ghost {
@@ -63,10 +66,94 @@ uint32_t primitive_count(D3DPRIMITIVETYPE t, uint32_t prim_count) {
     }
 }
 
+// D3DFMT -> DXGI for the formats write_dds() supports. DXT2/4 are the
+// premultiplied variants of DXT3/5; stored as their base format.
+bool d3d9_to_dxgi(D3DFORMAT f, uint32_t& dxgi) {
+    switch (f) {
+        case D3DFMT_A8R8G8B8: dxgi = DXGI_FORMAT_B8G8R8A8_UNORM; return true;
+        case D3DFMT_X8R8G8B8: dxgi = DXGI_FORMAT_B8G8R8X8_UNORM; return true;
+        case D3DFMT_A8B8G8R8: dxgi = DXGI_FORMAT_R8G8B8A8_UNORM; return true;
+        case D3DFMT_DXT1:     dxgi = DXGI_FORMAT_BC1_UNORM;      return true;
+        case D3DFMT_DXT2:
+        case D3DFMT_DXT3:     dxgi = DXGI_FORMAT_BC2_UNORM;      return true;
+        case D3DFMT_DXT4:
+        case D3DFMT_DXT5:     dxgi = DXGI_FORMAT_BC3_UNORM;      return true;
+        default:              return false;
+    }
+}
+
 } // namespace
 namespace {
 
-void capture_indexed(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
+// Dump the textures bound to stages 0..7 as DDS files. D3D9 keeps textures in
+// D3DPOOL_MANAGED for nearly all engine usage, so LockRect is the readback.
+void capture_textures(IDirect3DDevice9* device, const std::string& frame_dir,
+                      std::vector<fmt::TextureRef>& out) {
+    for (DWORD stage = 0; stage < 8; ++stage) {
+        IDirect3DBaseTexture9* base = nullptr;
+        if (FAILED(device->GetTexture(stage, &base)) || !base)
+            continue;
+
+        ComPtr<IDirect3DTexture9> tex;
+        // v1: plain 2D textures only (skip cube maps and volume maps).
+        if (FAILED(base->QueryInterface(IID_PPV_ARGS(tex.GetAddressOf())))) {
+            base->Release();
+            continue;
+        }
+        base->Release();
+        if (!tex)
+            continue;
+
+        D3DSURFACE_DESC desc{};
+        if (FAILED(tex->GetLevelDesc(0, &desc)))
+            continue;
+
+        uint32_t dxgi = 0;
+        if (!d3d9_to_dxgi(desc.Format, dxgi))
+            continue;
+
+        D3DLOCKED_RECT lr{};
+        if (FAILED(tex->LockRect(0, &lr, nullptr, D3DLOCK_READONLY)))
+            continue;
+
+        // Hash tightly packed pixel bytes so identical textures dedupe
+        // (same rolling scheme as the D3D11 capture).
+        const uint32_t tight = dds_tight_row_pitch(dxgi, desc.Width);
+        const uint32_t rows   = dds_is_compressed(dxgi) ? (desc.Height + 3) / 4
+                                                        : desc.Height;
+        uint64_t hash = 1469598103934665603ull;
+        const auto* base_px = static_cast<const uint8_t*>(lr.pBits);
+        for (uint32_t y = 0; y < rows && tight; ++y) {
+            const uint64_t row_hash = fnv1a64(base_px + static_cast<size_t>(y) * lr.Pitch,
+                                              tight);
+            hash ^= row_hash;
+            hash *= 1099511628211ull;
+        }
+
+        char file_name[96];
+        std::snprintf(file_name, sizeof(file_name), "textures/%016" PRIX64 ".dds",
+                      static_cast<uint64_t>(hash));
+        const std::string full_path = frame_dir + "\\" + file_name;
+
+        // Write only the first occurrence of this texture within the frame.
+        if (GetFileAttributesA(full_path.c_str()) == INVALID_FILE_ATTRIBUTES)
+            write_dds(full_path, desc.Width, desc.Height, dxgi, lr.pBits, lr.Pitch);
+        tex->UnlockRect(0);
+
+        fmt::TextureRef ref{};
+        ref.content_hash = hash;
+        ref.slot  = stage;
+        ref.usage = static_cast<uint32_t>(stage == 0 ? fmt::TextureUsage::Diffuse
+                                                     : fmt::TextureUsage::Unknown);
+        std::strncpy(ref.file, file_name, sizeof(ref.file) - 1);
+        out.push_back(ref);
+    }
+}
+
+} // namespace
+namespace {
+
+void capture_indexed(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT base_vertex_idx,
                      UINT min_index, UINT num_vertices, UINT start_index,
                      UINT prim_count) {
     CaptureContext& cap = CaptureContext::instance();
@@ -77,23 +164,24 @@ void capture_indexed(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
     const fmt::PrimitiveTopology topology = map_topology(type, topo_ok);
     if (!topo_ok) return;
 
-    // Vertex stream 0.
+    // Vertex stream 0: the draw declares it touches [min_index, min_index +
+    // num_vertices) of the stream (post stream-offset), so lock exactly that
+    // window and store indices relative to it via base_vertex.
     IDirect3DVertexBuffer9* vb = nullptr;
-    UINT stride = 0, vb_offset = 0;
-    if (FAILED(device->GetStreamSource(0, &vb, &vb_offset, &stride)) || !vb || stride == 0)
+    UINT stride = 0, stream_offset = 0;
+    if (FAILED(device->GetStreamSource(0, &vb, &stream_offset, &stride)) || !vb || stride == 0)
         return;
 
-    D3DVERTEXBUFFER_DESC vb_desc{};
-    vb->GetDesc(&vb_desc);
-    ComPtr<IDirect3DVertexBuffer9> staging_vb;
-    // D3D9 MANAGED/CPU-readable copy: lock the source directly if allowed.
+    const size_t lock_off  = static_cast<size_t>(stream_offset) +
+                             static_cast<size_t>(min_index) * stride;
+    const size_t lock_size = static_cast<size_t>(num_vertices) * stride;
     uint8_t* vb_data = nullptr;
-    if (FAILED(vb->Lock(vb_offset, num_vertices * stride,
-                        reinterpret_cast<void**>(&vb_data), D3DLOCK_READONLY))) {
+    if (FAILED(vb->Lock(lock_off, lock_size, reinterpret_cast<void**>(&vb_data),
+                        D3DLOCK_READONLY))) {
         vb->Release();
         return;
     }
-    std::vector<uint8_t> vb_bytes(vb_data, vb_data + num_vertices * stride);
+    std::vector<uint8_t> vb_bytes(vb_data, vb_data + lock_size);
     vb->Unlock();
     vb->Release();
 
@@ -127,7 +215,9 @@ void capture_indexed(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
     mesh.index_data_size = static_cast<uint32_t>(ib_bytes.size());
     mesh.index_count    = index_count;
     mesh.index_format   = (elem == 2) ? fmt::IndexFormat::UInt16 : fmt::IndexFormat::UInt32;
-    mesh.base_vertex    = -static_cast<int32_t>(min_index);  // indices are relative
+    // D3D9 fetches vertex (index + baseVertexIndex) of the stream; the stored
+    // blob starts at stream vertex min_index, so map indices into it.
+    mesh.base_vertex    = base_vertex_idx - static_cast<int32_t>(min_index);
 
     const uint32_t idx = cap.next_mesh_index();
     char name[64];
@@ -135,6 +225,10 @@ void capture_indexed(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
     mesh.name = name;
 
     const std::string path = cap.frame_dir() + "\\meshes\\" + name + ".grm";
+
+    if (cap.config().capture_textures)
+        capture_textures(device, cap.frame_dir(), mesh.textures);
+
     std::string err;
     if (write_mesh_file(path, mesh, cap.config().source_app, 0, &err))
         log::info("d3d9 captured %s", name);
@@ -155,10 +249,8 @@ HRESULT STDMETHODCALLTYPE hk_draw_indexed_primitive(IDirect3DDevice9* device,
                                                     D3DPRIMITIVETYPE type, INT base_vertex_idx,
                                                     UINT min_vertex_idx, UINT num_vertices,
                                                     UINT start_index, UINT prim_count) {
-    // D3D9 indices are relative to baseVertexIdx; treat min_index as the start
-    // of the referenced slice and offset indices down by that base.
-    (void)base_vertex_idx;
-    capture_indexed(device, type, min_vertex_idx, num_vertices, start_index, prim_count);
+    capture_indexed(device, type, base_vertex_idx, min_vertex_idx, num_vertices,
+                    start_index, prim_count);
     return g_orig_draw_indexed(device, type, base_vertex_idx, min_vertex_idx, num_vertices,
                                start_index, prim_count);
 }

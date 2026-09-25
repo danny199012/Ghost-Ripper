@@ -5,12 +5,16 @@
 #include "mesh_asset.h"
 #include "mesh_renderer.h"
 #include "obj_exporter.h"
+#include "gltf_exporter.h"
 #include "texture_loader.h"
 #include "gl_extra.h"
 
+#include "ghost/attribute.h"
+#include "ghost/capture_format.h"
 #include "ghost/log.h"
 #include "ghost/math.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -25,6 +29,50 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_opengl3_loader.h"
+
+// Path separator as a string ("\\" on Windows, "/" elsewhere).
+
+// Relative URI from a directory to a file, for glTF texture references: the
+// exporter writes the .gltf into a specific folder, and the DDS may sit in a
+// sibling folder (frame/meshes/ vs frame/textures/). Falls back to the plain
+// path when the two share no root (e.g. different drives).
+std::string relative_uri(const std::string& from_dir, const std::string& to) {
+    const auto split = [](const std::string& s) {
+        std::vector<std::string> parts;
+        std::string cur;
+        for (char c : s) {
+            if (c == '/' || c == '\\') {
+                if (!cur.empty()) parts.push_back(cur);
+                cur.clear();
+            } else {
+                cur += c;
+            }
+        }
+        if (!cur.empty()) parts.push_back(cur);
+        return parts;
+    };
+    const std::vector<std::string> a = split(from_dir);
+    const std::vector<std::string> b = split(to);
+    size_t common = 0;
+    while (common < a.size() && common < b.size() && a[common] == b[common])
+        ++common;
+    if (common == 0)
+        return to;  // no shared root: use the absolute path
+    std::string out;
+    for (size_t i = common; i < a.size(); ++i)
+        out += "../";
+    for (size_t i = common; i < b.size(); ++i) {
+        out += b[i];
+        if (i + 1 < b.size())
+            out += '/';
+    }
+    return out;
+}
+#ifdef _WIN32
+#define SEP_S "\\"
+#else
+#define SEP_S "/"
+#endif
 
 using namespace ghost;  // Vec3, Mat4, etc. from ghost/math.h
 
@@ -58,6 +106,11 @@ struct AppState {
     std::vector<ghost::viewer::MeshInfo> meshes;
     int selected = -1;
 
+    // Frame browser: sibling frame_* folders of the session this capture
+    // belongs to (empty when the folder is a flat capture dir).
+    std::vector<std::string> frames;
+    int frame_index = -1;
+
     std::unique_ptr<ghost::viewer::GPUMesh> gpu_mesh;  // loaded geometry
     std::string loaded_path;
 
@@ -65,6 +118,18 @@ struct AppState {
     bool wireframe  = false;
     bool show_tex   = true;
     bool auto_frame = true;  // re-center camera on a newly loaded mesh
+
+    // Inspector: texture preview panel.
+    bool show_texture_panel = true;
+
+    // Vertex-layout editor: an editable copy of the loaded mesh's attributes
+    // (heuristic guesses can be wrong; Apply re-decodes the raw bytes).
+    std::vector<ghost::fmt::MeshAttribute> edit_attrs;
+    int  edit_stride = 0;
+    int  edit_vertex_count = 0;
+
+    // Aggregate stats for the current folder.
+    ghost::viewer::CaptureStats stats;
 
     // FBO for the 3D viewport.
     unsigned int fbo = 0, fbo_color = 0, fbo_depth = 0;
@@ -81,6 +146,57 @@ void recenter_camera(Camera& cam, const Vec3& aabb_min, const Vec3& aabb_max) {
     cam.distance = size > 0.0001f ? size * 1.6f + 0.5f : 4.0f;
     cam.yaw   = -0.6f;
     cam.pitch = 0.4f;
+}
+
+// (Re)scan the current capture folder: mesh list, sibling frames and stats.
+void refresh_capture_dir(AppState& s) {
+    std::string err;
+    s.meshes = ghost::viewer::scan_capture_dir(s.capture_dir, &err);
+    s.selected = -1;
+    s.loaded_path.clear();
+    s.gpu_mesh.reset();
+
+    s.frames = ghost::viewer::list_frame_dirs(s.capture_dir);
+    s.frame_index = -1;
+    // When the session folder itself has no meshes but frame folders do,
+    // open the first frame right away.
+    if (s.meshes.empty() && !s.frames.empty()) {
+        s.frame_index = 0;
+        s.capture_dir = s.frames[0];
+        s.meshes = ghost::viewer::scan_capture_dir(s.capture_dir, &err);
+    } else if (!s.frames.empty()) {
+        for (size_t i = 0; i < s.frames.size(); ++i)
+            if (s.frames[i] == s.capture_dir)
+                s.frame_index = static_cast<int>(i);
+    } else {
+        // Maybe this folder *is* a frame inside a session folder.
+        const std::string parent = ghost::viewer::parent_dir(s.capture_dir);
+        std::vector<std::string> siblings = ghost::viewer::list_frame_dirs(parent);
+        if (!siblings.empty()) {
+            s.frames = std::move(siblings);
+            for (size_t i = 0; i < s.frames.size(); ++i)
+                if (s.frames[i] == s.capture_dir)
+                    s.frame_index = static_cast<int>(i);
+        }
+    }
+    s.stats = ghost::viewer::compute_capture_stats(s.capture_dir);
+}
+
+void open_frame(AppState& s, int index, ghost::viewer::MeshRenderer& renderer) {
+    if (index < 0 || index >= static_cast<int>(s.frames.size()))
+        return;
+    s.frame_index = index;
+    s.capture_dir = s.frames[index];
+    std::string err;
+    s.meshes = ghost::viewer::scan_capture_dir(s.capture_dir, &err);
+    s.selected = -1;
+    s.loaded_path.clear();
+    s.gpu_mesh.reset();
+    s.stats = ghost::viewer::compute_capture_stats(s.capture_dir);
+    s.status = "frame " + std::to_string(index + 1) + "/" +
+               std::to_string(s.frames.size()) + ": " +
+               std::to_string(s.meshes.size()) + " meshes";
+    (void)renderer;
 }
 
 } // namespace
@@ -129,8 +245,16 @@ void load_selected_mesh(AppState& s, ghost::viewer::MeshRenderer& renderer) {
     if (s.selected < 0 || s.selected >= static_cast<int>(s.meshes.size()))
         return;
     const std::string& path = s.meshes[s.selected].path;
+
+    // A saved layout override from a previous session wins over the file's
+    // heuristic guess.
+    ghost::viewer::LayoutOverride layout;
+    std::vector<ghost::fmt::MeshAttribute> saved;
+    if (ghost::viewer::load_layout_override(path, saved))
+        layout.attributes = saved;
+
     std::string err;
-    auto mesh = ghost::viewer::load_mesh(path, &err);
+    auto mesh = ghost::viewer::load_mesh(path, &err, layout.attributes.empty() ? nullptr : &layout);
     if (!mesh) {
         s.status = "load failed: " + err;
         return;
@@ -140,8 +264,37 @@ void load_selected_mesh(AppState& s, ghost::viewer::MeshRenderer& renderer) {
     renderer.upload(*s.gpu_mesh);
     if (s.auto_frame)
         recenter_camera(s.camera, renderer.aabb_min(), renderer.aabb_max());
+
+    // Seed the layout editor from the layout actually used.
+    s.edit_attrs = s.gpu_mesh->attributes;
+    s.edit_stride = static_cast<int>(s.gpu_mesh->vertex_stride);
+    s.edit_vertex_count = s.meshes[s.selected].vertex_count;
+
     s.status = "loaded " + s.meshes[s.selected].name +
-               " (" + std::to_string(renderer.triangle_count()) + " tris)";
+               " (" + std::to_string(renderer.triangle_count()) + " tris)" +
+               (s.gpu_mesh->texture_abs.empty() ? "" : ", texture: " + s.gpu_mesh->texture_rel);
+}
+
+// Re-decode the loaded file with the edited layout (Apply button).
+void apply_layout_edit(AppState& s, ghost::viewer::MeshRenderer& renderer) {
+    if (s.edit_attrs.empty() || s.loaded_path.empty()) {
+        s.status = "layout edit: nothing to apply";
+        return;
+    }
+    ghost::viewer::LayoutOverride layout;
+    layout.attributes = s.edit_attrs;
+    std::string err;
+    auto mesh = ghost::viewer::load_mesh(s.loaded_path, &err, &layout);
+    if (!mesh) {
+        s.status = "layout re-decode failed: " + err;
+        return;
+    }
+    s.gpu_mesh = std::move(mesh);
+    renderer.upload(*s.gpu_mesh);
+    if (s.auto_frame)
+        recenter_camera(s.camera, renderer.aabb_min(), renderer.aabb_max());
+    s.status = "re-decoded with " + std::to_string(s.edit_attrs.size()) + " attributes (" +
+               std::to_string(renderer.triangle_count()) + " tris)";
 }
 
 void draw_mesh_list(AppState& s, ghost::viewer::MeshRenderer& renderer) {
@@ -153,8 +306,7 @@ void draw_mesh_list(AppState& s, ghost::viewer::MeshRenderer& renderer) {
     if (ImGui::InputText("##dir", dir_buf, sizeof(dir_buf),
                          ImGuiInputTextFlags_EnterReturnsTrue)) {
         s.capture_dir = dir_buf;
-        s.meshes = ghost::viewer::scan_capture_dir(s.capture_dir);
-        s.selected = -1;
+        refresh_capture_dir(s);
         s.status = "scanned " + std::to_string(s.meshes.size()) + " meshes";
     }
     ImGui::PopItemWidth();
@@ -171,8 +323,7 @@ void draw_mesh_list(AppState& s, ghost::viewer::MeshRenderer& renderer) {
         if (ImGui::InputText("##pick", pick, sizeof(pick),
                              ImGuiInputTextFlags_EnterReturnsTrue)) {
             s.capture_dir = pick;
-            s.meshes = ghost::viewer::scan_capture_dir(s.capture_dir);
-            s.selected = -1;
+            refresh_capture_dir(s);
             s.status = "scanned " + std::to_string(s.meshes.size()) + " meshes";
             ImGui::CloseCurrentPopup();
         }
@@ -180,8 +331,7 @@ void draw_mesh_list(AppState& s, ghost::viewer::MeshRenderer& renderer) {
         ImGui::SameLine();
         if (ImGui::Button("OK")) {
             s.capture_dir = pick;
-            s.meshes = ghost::viewer::scan_capture_dir(s.capture_dir);
-            s.selected = -1;
+            refresh_capture_dir(s);
             s.status = "scanned " + std::to_string(s.meshes.size()) + " meshes";
             ImGui::CloseCurrentPopup();
         }
@@ -192,6 +342,52 @@ void draw_mesh_list(AppState& s, ghost::viewer::MeshRenderer& renderer) {
     }
 
     ImGui::Separator();
+
+    // ---- Frame browser: navigate the frame_* folders of a session ----
+    if (!s.frames.empty()) {
+        ImGui::TextDisabled("Frame");
+        if (ImGui::Button("<<##prev") && s.frame_index > 0)
+            open_frame(s, s.frame_index - 1, renderer);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(s.frame_index < 0 ||
+                             s.frame_index + 1 >= static_cast<int>(s.frames.size()));
+        if (ImGui::Button(">>##next"))
+            open_frame(s, s.frame_index + 1, renderer);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Text("%d/%d", s.frame_index + 1, static_cast<int>(s.frames.size()));
+
+        ImGui::PushItemWidth(-1);
+        if (ImGui::BeginCombo("##framecombo",
+                              s.frame_index >= 0 ? s.frames[s.frame_index].c_str()
+                                                 : "(select)")) {
+            for (int i = 0; i < static_cast<int>(s.frames.size()); ++i) {
+                char label[128];
+                std::snprintf(label, sizeof(label), "frame %d  (%s)", i + 1,
+                              s.frames[i].c_str() +
+                                  (s.frames[i].find_last_of("/\\") == std::string::npos
+                                       ? 0
+                                       : s.frames[i].find_last_of("/\\") + 1));
+                if (ImGui::Selectable(label, i == s.frame_index))
+                    open_frame(s, i, renderer);
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopItemWidth();
+        ImGui::Separator();
+    }
+
+    // ---- Statistics for the current folder ----
+    ImGui::TextDisabled("Statistics");
+    ImGui::Text("%d meshes, %llu verts, %llu tris", static_cast<int>(s.stats.mesh_count),
+                static_cast<unsigned long long>(s.stats.vertex_count),
+                static_cast<unsigned long long>(s.stats.triangle_count));
+    ImGui::Text("%u texture refs, %.1f MB DDS on disk", s.stats.texture_count,
+                static_cast<double>(s.stats.texture_bytes) / (1024.0 * 1024.0));
+    if (s.stats.frame_count > 0)
+        ImGui::Text("%u frames in session", s.stats.frame_count);
+    ImGui::Separator();
+
     ImGui::Text("%d meshes", static_cast<int>(s.meshes.size()));
     if (ImGui::BeginChild("##meshlist", ImVec2(0, 0), true)) {
         for (int i = 0; i < static_cast<int>(s.meshes.size()); ++i) {
@@ -314,12 +510,124 @@ void draw_inspector(AppState& s, ghost::viewer::MeshRenderer& renderer) {
     ImGui::Checkbox("Wireframe", &s.wireframe);
     ImGui::Checkbox("Show texture", &s.show_tex);
     ImGui::Checkbox("Auto-frame on load", &s.auto_frame);
+    ImGui::Checkbox("Texture panel", &s.show_texture_panel);
     if (ImGui::Button("Reset camera") && renderer.has_mesh())
         recenter_camera(s.camera, renderer.aabb_min(), renderer.aabb_max());
 
+    // ---- Texture preview (the mesh's bound DDS, decoded by the viewer) ----
+    if (s.show_texture_panel && renderer.has_mesh()) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Texture");
+        if (renderer.has_real_texture()) {
+            ImGui::Text("size: %dx%d", renderer.texture_width(), renderer.texture_height());
+            const std::string& path = renderer.texture_path();
+            const size_t slash = path.find_last_of("/\\");
+            ImGui::Text("file: %s", slash == std::string::npos ? path.c_str()
+                                                              : path.c_str() + slash + 1);
+            // Fit the preview into the panel width, preserving aspect ratio.
+            const float avail = ImGui::GetContentRegionAvail().x;
+            float w = static_cast<float>(renderer.texture_width());
+            float h = static_cast<float>(renderer.texture_height());
+            if (w > avail && w > 0.0f) {
+                h *= avail / w;
+                w = avail;
+            }
+            if (w > 0.0f && h > 0.0f)
+                ImGui::Image(static_cast<ImTextureID>(renderer.texture_id()), ImVec2(w, h));
+        } else {
+            ImGui::TextDisabled("no captured texture bound to this mesh");
+        }
+    }
+
+    // ---- Vertex layout editor -------------------------------------------
+    ImGui::Separator();
+    ImGui::TextDisabled("Vertex layout");
+    if (s.selected >= 0) {
+        static const struct { const char* name; uint32_t value; } kSemantics[] = {
+            {"Position", 0}, {"Normal", 1}, {"Tangent", 2}, {"Binormal", 3}, {"Color", 4},
+            {"TexCoord", 5}, {"BlendWeights", 6}, {"BlendIndices", 7}, {"Unknown", 0xFF},
+        };
+        static const struct { const char* name; uint32_t value; } kFormats[] = {
+            {"Unknown", 0}, {"F32", 1}, {"F32x2", 2}, {"F32x3", 3}, {"F32x4", 4},
+            {"F16x2", 5}, {"F16x4", 6}, {"UN8x2", 7}, {"UN8x4", 8}, {"SN8x4", 9},
+            {"U8x4", 10}, {"U16x2", 11}, {"U16x4", 12}, {"U32", 13}, {"U32x2", 14},
+            {"U32x3", 15}, {"U32x4", 16}, {"S32", 17}, {"S32x4", 18},
+        };
+        ImGui::Text("stride: %d  attrs: %d", s.edit_stride,
+                    static_cast<int>(s.edit_attrs.size()));
+        int remove_index = -1;
+        for (int i = 0; i < static_cast<int>(s.edit_attrs.size()); ++i) {
+            ghost::fmt::MeshAttribute& a = s.edit_attrs[i];
+            ImGui::PushID(i);
+            const char* sem_label = "?";
+            for (const auto& e : kSemantics)
+                if (e.value == a.semantic) sem_label = e.name;
+            ImGui::SetNextItemWidth(96);
+            if (ImGui::BeginCombo("##sem", sem_label)) {
+                for (const auto& e : kSemantics) {
+                    if (ImGui::Selectable(e.name, e.value == a.semantic))
+                        a.semantic = e.value;
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            const char* fmt_label = "?";
+            for (const auto& e : kFormats)
+                if (e.value == a.format) fmt_label = e.name;
+            ImGui::SetNextItemWidth(64);
+            if (ImGui::BeginCombo("##fmt", fmt_label)) {
+                for (const auto& e : kFormats) {
+                    if (ImGui::Selectable(e.name, e.value == a.format))
+                        a.format = e.value;
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(48);
+            int off = static_cast<int>(a.offset);
+            if (ImGui::InputInt("##off", &off, 0, 0))
+                a.offset = off < 0 ? 0 : static_cast<uint32_t>(off);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                remove_index = i;
+            ImGui::PopID();
+        }
+        if (remove_index >= 0)
+            s.edit_attrs.erase(s.edit_attrs.begin() + remove_index);
+
+        if (ImGui::Button("+ Attribute")) {
+            ghost::fmt::MeshAttribute a{};
+            a.semantic = static_cast<uint32_t>(ghost::fmt::Semantic::Unknown);
+            a.format = static_cast<uint32_t>(ghost::fmt::AttributeFormat::Float32x2);
+            s.edit_attrs.push_back(a);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Apply"))
+            apply_layout_edit(s, renderer);
+        ImGui::SameLine();
+        if (ImGui::Button("Reset")) {
+            s.edit_attrs = s.gpu_mesh ? s.gpu_mesh->attributes
+                                      : std::vector<ghost::fmt::MeshAttribute>{};
+            s.status = "layout reset to the loaded layout";
+        }
+        if (ImGui::Button("Save layout") && !s.loaded_path.empty()) {
+            std::string err;
+            if (ghost::viewer::save_layout_override(s.loaded_path, s.edit_attrs, &err))
+                s.status = "saved " + s.loaded_path + ".layout";
+            else
+                s.status = "layout save failed: " + err;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(auto-applied on load)");
+    } else {
+        ImGui::TextDisabled("select a mesh to edit its layout");
+    }
+
     ImGui::Separator();
     ImGui::TextDisabled("Export");
-    ImGui::BeginDisabled(!renderer.has_mesh());
+    // OBJ/glTF need a loaded GPU mesh + a valid selection (the renderer may
+    // still show the previous frame's mesh right after switching frames).
+    ImGui::BeginDisabled(!s.gpu_mesh || s.selected < 0);
     if (ImGui::Button("Export OBJ")) {
         // Save next to the loaded capture file with an .obj extension.
         std::string out = s.loaded_path;
@@ -331,6 +639,71 @@ void draw_inspector(AppState& s, ghost::viewer::MeshRenderer& renderer) {
             s.status = "exported " + out;
         else
             s.status = "export failed: " + err;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export glTF")) {
+        std::string out = s.loaded_path;
+        const size_t dot = out.find_last_of('.');
+        if (dot != std::string::npos) out = out.substr(0, dot);
+        out += ".gltf";
+        std::string err;
+        ghost::viewer::GltfMeshInput in;
+        in.mesh = s.gpu_mesh.get();
+        in.name = s.meshes[s.selected].name;
+        if (!s.gpu_mesh->texture_rel.empty())
+            in.texture_uri = relative_uri(ghost::viewer::parent_dir(out),
+                                          s.gpu_mesh->texture_abs);
+        const std::vector<ghost::viewer::GltfMeshInput> inputs{in};
+        if (ghost::viewer::export_gltf(out, inputs, &err))
+            s.status = "exported " + out;
+        else
+            s.status = "glTF export failed: " + err;
+    }
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(s.meshes.empty());
+    if (ImGui::Button("Export all OBJ")) {
+        uint32_t ok_count = 0;
+        for (const auto& info : s.meshes) {
+            std::string err;
+            auto mesh = ghost::viewer::load_mesh(info.path, &err);
+            if (!mesh)
+                continue;
+            const std::string out = info.path.substr(0, info.path.find_last_of('.')) + ".obj";
+            if (ghost::viewer::export_obj(out, *mesh, &err))
+                ++ok_count;
+        }
+        s.status = "batch OBJ: " + std::to_string(ok_count) + "/" +
+                   std::to_string(s.meshes.size()) + " meshes";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export frame glTF")) {
+        // All meshes of the folder become nodes of one scene.
+        std::string out_path = s.capture_dir;
+        if (!out_path.empty() && (out_path.back() == '/' || out_path.back() == '\\'))
+            out_path.pop_back();
+        out_path += SEP_S + std::string("frame.gltf");
+        std::vector<ghost::viewer::GltfMeshInput> inputs;
+        std::vector<std::unique_ptr<ghost::viewer::GPUMesh>> keep;
+        for (const auto& info : s.meshes) {
+            std::string err;
+            auto mesh = ghost::viewer::load_mesh(info.path, &err);
+            if (!mesh)
+                continue;
+            ghost::viewer::GltfMeshInput in;
+            in.name = info.name;
+            if (!mesh->texture_abs.empty())
+                in.texture_uri = relative_uri(ghost::viewer::parent_dir(out_path),
+                                              mesh->texture_abs);
+            keep.push_back(std::move(mesh));
+            in.mesh = keep.back().get();
+            inputs.push_back(in);
+        }
+        std::string err;
+        if (!inputs.empty() && ghost::viewer::export_gltf(out_path, inputs, &err))
+            s.status = "exported " + std::to_string(inputs.size()) + " meshes -> " + out_path;
+        else
+            s.status = "frame glTF export failed: " + err;
     }
     ImGui::EndDisabled();
 
@@ -394,7 +767,7 @@ int main(int argc, char** argv) {
 
     AppState s;
     s.capture_dir = (argc > 1) ? argv[1] : "captures";
-    s.meshes = ghost::viewer::scan_capture_dir(s.capture_dir);
+    refresh_capture_dir(s);
     s.status = "scanned " + std::to_string(s.meshes.size()) + " meshes in " + s.capture_dir;
 
     // --- main loop ---
@@ -409,10 +782,14 @@ int main(int argc, char** argv) {
         if (ImGui::BeginMainMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Rescan folder")) {
-                    s.meshes = ghost::viewer::scan_capture_dir(s.capture_dir);
-                    s.selected = -1;
+                    refresh_capture_dir(s);
                     s.status = "rescanned: " + std::to_string(s.meshes.size()) + " meshes";
                 }
+                if (ImGui::MenuItem("Next frame") && s.frame_index >= 0 &&
+                    s.frame_index + 1 < static_cast<int>(s.frames.size()))
+                    open_frame(s, s.frame_index + 1, renderer);
+                if (ImGui::MenuItem("Previous frame") && s.frame_index > 0)
+                    open_frame(s, s.frame_index - 1, renderer);
                 if (ImGui::MenuItem("Exit"))
                     glfwSetWindowShouldClose(window, GLFW_TRUE);
                 ImGui::EndMenu();

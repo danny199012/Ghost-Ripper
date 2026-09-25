@@ -21,7 +21,23 @@
 
 namespace {
 
-// P (float3) + N (float3) + UV (float2) = 32 bytes, matches the guesser table.
+std::string parent_of(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? std::string() : path.substr(0, slash);
+}
+
+// Create every missing component of `path` (single-level mkdir fails on
+// nested paths like captures/session/frame_000001/meshes).
+void make_dirs(const std::string& path) {
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur += path[i];
+        const bool last = (i + 1 == path.size());
+        if (last || path[i] == '/' || path[i] == '\\')
+            mkdir_one(cur.c_str());  // EEXIST is fine
+    }
+}
+
 struct Vertex {
     float px, py, pz;
     float nx, ny, nz;
@@ -113,11 +129,164 @@ bool write(const std::string& dir, const char* name,
     return true;
 }
 
+// Minimal 32bpp BGRA DDS writer (the same shape the hook dumps) so sample
+// captures can carry a texture without a game. Draws a checker with a colour
+// gradient so it is obvious in the viewer's texture panel.
+bool write_sample_dds(const std::string& path, uint32_t w, uint32_t h) {
+    struct PixelFormat {
+        uint32_t size, flags, four_cc, bit_count, r, g, b, a;
+    };
+    struct Header {
+        uint32_t size, flags, height, width, pitch, depth, mips, reserved[11];
+        PixelFormat pf;
+        uint32_t caps, caps2, caps3, caps4, reserved2;
+    };
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t* px = pixels.data() + (static_cast<size_t>(y) * w + x) * 4;
+            const bool light = (((x / 16) + (y / 16)) % 2) == 0;
+            const uint8_t base = light ? 220 : 80;
+            px[0] = static_cast<uint8_t>(base / 2);                 // B
+            px[1] = static_cast<uint8_t>((x * 255) / (w ? w : 1));  // G
+            px[2] = static_cast<uint8_t>((y * 255) / (h ? h : 1));  // R
+            px[3] = 255;
+        }
+    }
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f)
+        return false;
+    const uint32_t magic = 0x20534444;  // "DDS "
+    std::fwrite(&magic, sizeof(magic), 1, f);
+
+    Header hdr{};
+    hdr.size = 124;
+    hdr.flags = 0x1 | 0x2 | 0x4 | 0x8 | 0x1000;  // caps|height|width|pitch|pf
+    hdr.height = h;
+    hdr.width = w;
+    hdr.pitch = w * 4;
+    hdr.mips = 1;
+    hdr.pf.size = 32;
+    hdr.pf.flags = 0x40 | 0x1;  // RGB | ALPHAPIXELS
+    hdr.pf.bit_count = 32;
+    hdr.pf.r = 0x00FF0000;
+    hdr.pf.g = 0x0000FF00;
+    hdr.pf.b = 0x000000FF;
+    hdr.pf.a = 0xFF000000;
+    hdr.caps = 0x1000;  // DDSCAPS_TEXTURE
+    std::fwrite(&hdr, sizeof(hdr), 1, f);
+    std::fwrite(pixels.data(), 1, pixels.size(), f);
+    std::fclose(f);
+    return true;
+}
+
+// Fill MeshData for a textured sample mesh (textures/checker.dds).
+void fill_mesh(ghost::MeshData& mesh, const char* name, const std::vector<Vertex>& verts,
+               const std::vector<uint32_t>& indices) {
+    mesh.name = name;
+    mesh.attributes = ghost::guess_vertex_layout(sizeof(Vertex));
+    mesh.vertex_data = verts.data();
+    mesh.vertex_data_size = static_cast<uint32_t>(verts.size() * sizeof(Vertex));
+    mesh.vertex_count = static_cast<uint32_t>(verts.size());
+    mesh.vertex_stride = sizeof(Vertex);
+    mesh.index_data = indices.data();
+    mesh.index_data_size = static_cast<uint32_t>(indices.size() * sizeof(uint32_t));
+    mesh.index_count = static_cast<uint32_t>(indices.size());
+    mesh.index_format = ghost::fmt::IndexFormat::UInt32;
+    mesh.topology = ghost::fmt::PrimitiveTopology::TriangleList;
+
+    ghost::fmt::TextureRef tex{};
+    tex.content_hash = 0xC0FFEE12ull;
+    tex.slot = 0;
+    tex.usage = static_cast<uint32_t>(ghost::fmt::TextureUsage::Diffuse);
+    std::snprintf(tex.file, sizeof(tex.file), "textures/checker.dds");
+    mesh.textures.push_back(tex);
+}
+
+// Write a textured mesh into a flat capture folder.
+bool write_textured(const std::string& dir, const char* name,
+                    const std::vector<Vertex>& verts, const std::vector<uint32_t>& indices) {
+    ghost::MeshData mesh;
+    fill_mesh(mesh, name, verts, indices);
+    const std::string path = dir + "/" + name + ".grm";
+    std::string err;
+    if (!ghost::write_mesh_file(path, mesh, "sample_gen", 0, &err)) {
+        std::fprintf(stderr, "sample_gen: %s\n", err.c_str());
+        return false;
+    }
+    std::printf("wrote %s (%zu verts, %zu tris, 1 texture)\n", path.c_str(), verts.size(),
+                indices.size() / 3);
+    return true;
+}
+
+void write_manifest(const std::string& frame_dir, const char* api, uint32_t frame,
+                    uint32_t mesh_count) {
+    FILE* f = std::fopen((frame_dir + "/manifest.json").c_str(), "w");
+    if (!f)
+        return;
+    std::fprintf(f,
+                 "{\n"
+                 "  \"tool\": \"Ghost-Ripper\",\n"
+                 "  \"format\": \"GRMF\",\n"
+                 "  \"format_version\": %u,\n"
+                 "  \"api\": \"%s\",\n"
+                 "  \"app\": \"sample_gen\",\n"
+                 "  \"pid\": 0,\n"
+                 "  \"frame\": %u,\n"
+                 "  \"mesh_count\": %u\n"
+                 "}\n",
+                 ghost::fmt::kVersion, api, frame, mesh_count);
+    std::fclose(f);
+}
+
+// Mimic the hook's session layout (session/frame_XXXXXX/{meshes,textures}) with
+// two frames so the viewer's frame browser has something to navigate.
+bool write_session(const std::string& session) {
+    std::vector<Vertex> verts;
+    std::vector<uint32_t> indices;
+
+    for (uint32_t frame = 1; frame <= 2; ++frame) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "frame_%06u", frame);
+        const std::string frame_dir = session + "/" + name;
+        make_dirs(frame_dir + "/meshes");
+        make_dirs(frame_dir + "/textures");
+
+        if (!write_sample_dds(frame_dir + "/textures/checker.dds", 128, 128))
+            return false;
+
+        verts.clear();
+        indices.clear();
+        make_cube(verts, indices);
+        if (frame == 2) {  // make the second frame visibly different
+            for (Vertex& v : verts) {
+                v.px *= 1.6f;
+                v.py *= 1.6f;
+                v.pz *= 1.6f;
+            }
+        }
+
+        ghost::MeshData mesh;
+        fill_mesh(mesh, "Mesh_0000", verts, indices);
+        std::string err;
+        const std::string path = frame_dir + "/meshes/Mesh_0000.grm";
+        if (!ghost::write_mesh_file(path, mesh, "sample_gen", frame, &err)) {
+            std::fprintf(stderr, "sample_gen: %s\n", err.c_str());
+            return false;
+        }
+        write_manifest(frame_dir, "sample", frame, 1);
+        std::printf("wrote %s (frame %u)\n", path.c_str(), frame);
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "captures/sample";
-    mkdir_one(dir.c_str());  // best effort; single level
+    make_dirs(dir);
 
     std::vector<Vertex> verts;
     std::vector<uint32_t> indices;
@@ -133,6 +302,17 @@ int main(int argc, char** argv) {
     verts.clear(); indices.clear();
     make_grid(verts, indices);
     if (!write(dir, "grid", verts, indices)) return 1;
+
+    // A textured mesh with its DDS (flat layout), plus a hook-style session
+    // tree with two frames for the viewer's frame browser.
+    const std::string prev_dir = parent_of(dir);
+    const std::string session = (prev_dir.empty() ? dir : prev_dir) + "/session";
+    make_dirs(dir + "/textures");
+    if (!write_sample_dds(dir + "/textures/checker.dds", 128, 128)) return 1;
+    verts.clear(); indices.clear();
+    make_cube(verts, indices);
+    if (!write_textured(dir, "cube_textured", verts, indices)) return 1;
+    if (!write_session(session)) return 1;
 
     return 0;
 }

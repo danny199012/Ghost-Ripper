@@ -1,0 +1,69 @@
+# GitHub Actions build workflow for Ghost-Ripper.
+#
+# To enable CI, copy this file to .github/workflows/build.yml. It builds the
+# full Windows MSVC target set (injector, hook DLL, viewer, tools), runs the
+# unit tests, and builds the Linux viewer/tools with a tools smoke test.
+name: build
+
+on:
+  push:
+    branches: [ main, master, "cline/**" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Windows: everything, including the injector and the hook DLL (D3D9/11/12 +
+  # Vulkan), built with MSVC like the release build.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-ripper-windows
+          path: |
+            build/bin/Release/ghost-inject.exe
+            build/bin/Release/ghost_hook.dll
+            build/bin/Release/ghost-viewer.exe
+            build/bin/Release/sample_gen.exe
+            build/bin/Release/grinfo.exe
+          if-no-files-found: warn
+
+  # Linux: viewer + tools + tests (the hook/injector are Windows-only but the
+  # shared capture-format/viewer code and the exporters are cross-platform).
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GLFW/OpenGL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl-dev libglu1-mesa-dev xorg-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke-test the tools
+        run: |
+          ./build/bin/sample_gen /tmp/ghost_samples
+          ./build/bin/grinfo /tmp/ghost_samples/cube.grm

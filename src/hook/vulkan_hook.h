@@ -1,14 +1,28 @@
-// Vulkan hooking (scaffolding).
+// Vulkan hooking + draw capture.
 //
-// We intercept vkQueuePresentKHR as the frame boundary. Because Vulkan loads
-// its commands via vkGetInstanceProcAddr / vkGetDeviceProcAddr at runtime,
-// we replace vkGetInstanceProcAddr with a shim that returns our wrappers for
-// present and the queue submit family, while still forwarding everything else
-// to the real loader. A small amount of per-device trampoline bookkeeping is
-// needed because each VkDevice can have its own function pointers.
+// Vulkan has no import library in the Windows SDK and no COM vtables; the
+// loader hands out dispatchable function pointers via vkGetInstanceProcAddr /
+// vkGetDeviceProcAddr. We MinHook the *loader exports* of those two functions
+// plus vkGetDeviceQueue/vkAllocateCommandBuffers to learn every VkDevice early,
+// then resolve the device-level commands through the real (saved) loader
+// pointers and MinHook them once per unique address — the driver serves the
+// same pointer for every device of one ICD, and any call path the app uses
+// (export, gipa, gdpa, dispatch table) ends in that same code.
 //
-// Only present-based frame-boundary detection + manifest writing is wired up
-// now; geometry capture is TODO. See docs/ROADMAP.md.
+// Capture works like D3D12: while a frame is open we observe command-buffer
+// recording (vkCmdBindVertexBuffers(2)/vkCmdBindIndexBuffer/vkCmdBindPipeline/
+// vkCmdSetPrimitiveTopology/vkCmdDraw/vkCmdDrawIndexed, plus
+// vkCreateGraphicsPipelines for pipeline topologies and vkBeginCommandBuffer
+// to clear per-command-buffer state). At vkQueuePresentKHR the recorded
+// vertex/index ranges are copied through a staging buffer on the presenting
+// queue (submit + fence wait) and written out as .grm files.
+//
+// Limitations (see docs/ROADMAP.md): apps that dig raw ICD pointers out of
+// the dispatch table bypass the loader (rare; they also break layers); only
+// the first ICD's function pointers are hooked (and therefore only its
+// devices are captured); draw indirect is not captured; stream 1+ and texture
+// capture need GRMF v2; pipeline/command-buffer bookkeeping is never pruned
+// (one entry per distinct handle for the process lifetime).
 #pragma once
 
 namespace ghost {
