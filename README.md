@@ -123,7 +123,8 @@ export's texture references work out of the box.
 
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — components, data flow, hooking strategy
 * [docs/CAPTURE_FORMAT.md](docs/CAPTURE_FORMAT.md) — the `.grm` binary format specification
-* [docs/ROADMAP.md](docs/ROADMAP.md) — planned work (D3D12/Vulkan capture, glTF export, ...)
+* [docs/ROADMAP.md](docs/ROADMAP.md) — planned work (D3D12/Vulkan texture dump, multi-stream capture, ...)
+* [CHANGELOG.md](CHANGELOG.md) — what changed in v0.2
 
 ## License
 
