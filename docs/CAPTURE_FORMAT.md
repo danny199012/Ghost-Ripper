@@ -129,16 +129,44 @@ All integers are **little-endian**. All multi-byte fields use fixed-width
 ## Vertex & index data
 
 The vertex data section is `vertex_count × vertex_stride` bytes of raw GPU
-vertex buffer data (minus any IASetVertexBuffers byte offset, which is
-stripped). The index data section contains only the indices used by this
-draw (sliced via `start_index` + `index_count`). Index values reference the
-full vertex buffer; viewers apply `base_vertex` when rendering.
+vertex data: the window of vertices the draw actually referenced, i.e. it may
+start at a non-zero vertex of the source buffer. The index data section holds
+only the indices used by this draw.
+
+**Addressing contract (important):** index values are stored *unchanged*, as
+they appear in the source index buffer. A viewer addresses the stored vertex
+data with
+
+```
+vertex = vertex_data[index[i] + base_vertex]
+```
+
+`base_vertex` may be negative (it is chosen by the hook so that the
+referenced window maps to offset 0 of the stored slice). Readers should drop
+indices whose effective value falls outside `[0, vertex_count)`. Concretely:
+
+| API | stored `base_vertex` |
+|-----|--------------------|
+| D3D11 | the draw's `BaseVertexLocation` |
+| D3D9 | `BaseVertexIndex − MinVertexIndex` (window starts at `MinVertexIndex`) |
+| D3D12 | `BaseVertexLocation − min(index + BaseVertexLocation)` |
+| Vulkan | `vertexOffset + bindingOffset/stride − min(effective vertex)` |
+
+Non-indexed draws store `index_count = 0` and a `vertex_count`-sized slice;
+viewers then use sequential vertex indices.
+
+`start_index` / `base_vertex` in the header keep the original draw-call
+parameters for reference.
 
 ## Texture hashing
 
 Texture pixel data is hashed with FNV-1a 64-bit to deduplicate identical
 textures within a frame. The hash is the DDS file name:
-`textures/<hash>.dds`, written once per unique texture.
+`textures/<hash>.dds`, written once per unique texture. D3D11 writes PS
+shader resources (slots 0-7) and D3D9 writes texture stages 0-7 as plain 2D
+textures: 32bpp A8R8G8B8 / X8R8G8B8 / A8B8G8R8 use the legacy DDS header,
+block-compressed formats (BC1-BC7) use the DX10 extension header. `usage` is
+a best guess from the slot (0 = Diffuse, otherwise Unknown) for now.
 
 ## Forward compatibility
 
