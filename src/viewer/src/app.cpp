@@ -625,7 +625,9 @@ void draw_inspector(AppState& s, ghost::viewer::MeshRenderer& renderer) {
 
     ImGui::Separator();
     ImGui::TextDisabled("Export");
-    ImGui::BeginDisabled(!renderer.has_mesh());
+    // OBJ/glTF need a loaded GPU mesh + a valid selection (the renderer may
+    // still show the previous frame's mesh right after switching frames).
+    ImGui::BeginDisabled(!s.gpu_mesh || s.selected < 0);
     if (ImGui::Button("Export OBJ")) {
         // Save next to the loaded capture file with an .obj extension.
         std::string out = s.loaded_path;

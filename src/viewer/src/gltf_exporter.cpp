@@ -366,8 +366,9 @@ bool export_gltf(const std::string& out_path,
     j += "  \"buffers\": [\n    {\n      \"byteLength\": " + fmt_size(bin.size())
          + ",\n      \"uri\": " + json_escape(base_name(out_path) + ".bin") + "\n    }\n  ]\n";
     if (any_dds) {
-        j += ",\n  \"extensionsUsed\": [\"MSFT_texture_dds\"]";
-        j += ",\n  \"extensionsRequired\": [\"MSFT_texture_dds\"]\n";
+        // extensionsUsed only (not extensionsRequired): loaders without DDS
+        // support should still import the geometry, just without textures.
+        j += ",\n  \"extensionsUsed\": [\"MSFT_texture_dds\"]\n";
     }
     j += "}\n";
 

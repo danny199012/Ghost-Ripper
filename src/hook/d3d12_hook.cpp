@@ -394,8 +394,14 @@ void STDMETHODCALLTYPE hk_execute_command_lists(ID3D12CommandQueue* queue, UINT 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_queue && queue) {
+            // GetDesc() returns the struct by value on MSVC / non-Windows and
+            // through an out-pointer on Wine/mingw - take both paths.
             D3D12_COMMAND_QUEUE_DESC desc{};
+#ifdef _MSC_VER
+            desc = queue->GetDesc();
+#else
             queue->GetDesc(&desc);
+#endif
             if (desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
                 ComPtr<ID3D12Device> device;
                 if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(device.GetAddressOf())))) {
